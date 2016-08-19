@@ -1,0 +1,228 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import subprocess
+
+CONFIG_NAME = 'config/config'
+CONFIG_FORMATS = ('yaml', 'json')
+
+def load_json(config_file):
+  import json
+  with open(config_file) as f:
+    return json.loads(f.read())
+
+def load_yaml(config_file):
+  import yaml
+  with open(config_file) as f:
+    return yaml.load(f.read())
+
+def load_config():
+  hook_path = os.path.dirname(os.path.abspath(__file__))
+  for config_format in CONFIG_FORMATS:
+    config_file = os.path.join(hook_path, '%s.%s' % (CONFIG_NAME, config_format))
+    if os.path.isfile(config_file):
+      load_func = globals()['load_' + config_format]
+      try:
+        return load_func(config_file)
+      except Exception as e:
+        raise Exception('Load config file "%s" error: %s' % (config_file, e))
+
+  raise Exception('No config found')
+
+
+def host_ip():
+    """Returns the default route interface IP (if any).
+
+    In other words, the public IP used to access the virtualization host. It
+    is used as default public IP for guest forwarding rules should they not
+    specify a different public IP to forward from.
+    """
+    if not hasattr(host_ip, "_host_ip"):
+        cmd = "ip route | grep default | cut -d' ' -f5"
+        default_route_interface = subprocess.check_output(cmd, shell=True).decode().strip()
+        cmd = "ip addr show {0} | grep -E 'inet .*{0}' | cut -d' ' -f6 | cut -d'/' -f1".format(default_route_interface)
+        host_ip._host_ip = subprocess.check_output(cmd, shell=True).decode().strip()
+    return host_ip._host_ip.split('\n')[0]
+
+
+def iptables(table=None, command='-L', chain='', parameters={}, extras={}):
+  cmd = ['iptables']
+
+  if table:
+    cmd += ['-t', table]
+
+  cmd += [command]
+  if chain:
+    cmd += [chain]
+
+  for param_group in [parameters, extras]:
+    for option, value in param_group.items():
+      if value is None:
+        continue
+      cmd.append('--' + option)
+      if value:
+        cmd.append(value)
+
+  print('==== Running: %s' % cmd)
+
+  result = subprocess.call(cmd)
+  if result != 0:
+    print('Error executing iptables: %s' % cmd)
+#    raise Exception('Error executing iptables: %s' % cmd)
+
+
+def append_rule(table, chain, jump, protocol=None, source=None, destination=None, dport=None, to=None, out_interface=None):
+  parameters = {}
+  parameters['protocol']      = protocol
+  parameters['jump']          = jump
+  parameters['source']        = source
+  parameters['destination']   = destination
+  parameters['dport']         = dport
+  parameters['out-interface'] = out_interface
+
+  extras = {}
+  extras['to'] = to
+
+  iptables(table, '-A', chain, parameters, extras)
+
+
+def new_chain(table, chain):
+  iptables(table, '-N', chain)
+
+def delete_chain(table, chain):
+  iptables(table, '-F', chain)
+  iptables(table, '-X', chain)
+
+def insert_chain_rule(table, chain, user_chain, source=None, destination=None):
+  parameters = {}
+  parameters['jump']        = user_chain
+  parameters['source']      = source
+  parameters['destination'] = destination
+  iptables(table, '-I', chain, parameters)
+
+def delete_chain_rule(table, chain, user_chain, source=None, destination=None):
+  parameters = {}
+  parameters['jump']        = user_chain
+  parameters['source']      = source
+  parameters['destination'] = destination
+  iptables(table, '-D', chain, parameters)
+
+
+class LibvirtForward:
+  def __init__(self, domain, global_config, domain_config):
+    self.__domain = domain
+    self.__config = global_config
+    self.__config.update(domain_config)
+
+    self.__init_chain_names()
+#    self.__init_ip()
+
+  def __init_chain_names(self):
+    self.__dnat_chain_name = 'DNAT-' + self.__domain
+    self.__snat_chain_name = 'SNAT-' + self.__domain
+    self.__fwd_chain_name = 'FWD-' + self.__domain
+
+
+  def __start_snat(self):
+    new_chain('nat', self.__snat_chain_name)
+
+    port_map = self.__config['port_map']
+    for protocol in port_map:
+      for ports in port_map[protocol]:
+        public_port, private_port = ports if isinstance(ports, list) else [ports, ports]
+        append_rule('nat', self.__snat_chain_name, 'MASQUERADE',
+            protocol=protocol, destination=self.__config['private_ip'], dport=str(private_port))
+
+    insert_chain_rule('nat', 'POSTROUTING', self.__snat_chain_name, source=self.__config['local_range'], destination=self.__config['private_ip'])
+
+  def __stop_snat(self):
+    delete_chain_rule('nat', 'POSTROUTING', self.__snat_chain_name, source=self.__config['local_range'], destination=self.__config['private_ip'])
+
+    delete_chain('nat', self.__snat_chain_name)
+
+
+  def __start_dnat(self):
+    new_chain('nat', self.__dnat_chain_name)
+
+    port_map = self.__config['port_map']
+    for protocol in port_map:
+      for ports in port_map[protocol]:
+        public_port, private_port = ports if isinstance(ports, list) else [ports, ports]
+        to = '%s:%s' % (self.__config['private_ip'], private_port)
+        append_rule('nat', self.__dnat_chain_name, 'DNAT',
+            protocol=protocol, destination=self.__config['public_ip'], dport=str(public_port), to=to)
+
+    insert_chain_rule('nat', 'OUTPUT', self.__dnat_chain_name, destination=self.__config['public_ip'])
+    insert_chain_rule('nat', 'PREROUTING', self.__dnat_chain_name, destination=self.__config['public_ip'])
+
+  def __stop_dnat(self):
+    delete_chain_rule('nat', 'OUTPUT', self.__dnat_chain_name, destination=self.__config['public_ip'])
+    delete_chain_rule('nat', 'PREROUTING', self.__dnat_chain_name, destination=self.__config['public_ip'])
+
+    delete_chain('nat', self.__dnat_chain_name)
+
+
+  def __start_forward(self):
+    new_chain('filter', self.__fwd_chain_name)
+
+    port_map = self.__config['port_map']
+    for protocol in port_map:
+      for ports in port_map[protocol]:
+        public_port, private_port = ports if isinstance(ports, list) else [ports, ports]
+        interface = self.__config.get('interface', None)
+        append_rule('filter', self.__fwd_chain_name, 'ACCEPT',
+            protocol=protocol, destination=self.__config['private_ip'], dport=str(private_port), out_interface=interface)
+
+    insert_chain_rule('filter', 'FORWARD', self.__fwd_chain_name, destination=self.__config['private_ip'])
+
+  def __stop_forward(self):
+    delete_chain_rule('filter', 'FORWARD', self.__fwd_chain_name, destination=self.__config['private_ip'])
+
+    delete_chain('filter', self.__fwd_chain_name)
+
+
+  def start(self):
+    print('Start snat')
+    self.__start_snat()
+    print('Start dnat')
+    self.__start_dnat()
+    print('Start forward')
+    self.__start_forward()
+
+  def stop(self):
+    print('Stop snat')
+    self.__stop_snat()
+    print('Stop dnat')
+    self.__stop_dnat()
+    print('Stop forward')
+    self.__stop_forward()
+
+
+def main():
+  domain, action = sys.argv[1:3]
+
+  try:
+    config_all = load_config()
+  except Exception as e:
+    print(e)
+    return -1
+
+  global_config = {}
+  global_config['public_ip'] = config_all.get('public_ip', host_ip())
+  global_config['local_range'] = config_all.get('local_range')
+
+  domain_config = config_all['domain'].get(domain)
+  if domain_config is None:
+    sys.exit(0)
+
+
+  forward = LibvirtForward(domain, global_config, domain_config)
+
+  if action in ['stopped', 'reconnect']:
+    forward.stop()
+  if action in ['start', 'reconnect']:
+    forward.start()
+
+if __name__ == '__main__':
+  main()
