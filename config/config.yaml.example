@@ -3,7 +3,7 @@ public_ip: 222.222.222.222
 local_range: 192.168.122.0/24
 
 domain:
-  OpenNebula:
+  MySQL:
     private_ip: 192.168.122.20
     local_range: 192.168.122.0/25
     port_map:
@@ -11,7 +11,7 @@ domain:
         - [8022, 22]
         - 3306
 
-  SL7-test:
+  Apache:
     interface: virbr0
     private_ip: 192.168.122.30
     port_map:
