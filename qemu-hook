@@ -2,6 +2,7 @@
 
 import os
 import sys
+import hashlib
 import subprocess
 
 CONFIG_NAME = 'config/config'
@@ -30,6 +31,10 @@ def load_config():
 
   raise Exception('No config found')
 
+def check_output(cmd):
+  p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+  return p.communicate()[0].decode().strip()
+
 
 def host_ip():
     """Returns the default route interface IP (if any).
@@ -40,9 +45,9 @@ def host_ip():
     """
     if not hasattr(host_ip, "_host_ip"):
         cmd = "ip route | grep default | cut -d' ' -f5"
-        default_route_interface = subprocess.check_output(cmd, shell=True).decode().strip()
+        default_route_interface = check_output(cmd)
         cmd = "ip addr show {0} | grep -E 'inet .*{0}' | cut -d' ' -f6 | cut -d'/' -f1".format(default_route_interface)
-        host_ip._host_ip = subprocess.check_output(cmd, shell=True).decode().strip()
+        host_ip._host_ip = check_output(cmd)
     return host_ip._host_ip.split('\n')[0]
 
 
@@ -119,9 +124,16 @@ class LibvirtForward:
 #    self.__init_ip()
 
   def __init_chain_names(self):
-    self.__dnat_chain_name = 'DNAT-' + self.__domain
-    self.__snat_chain_name = 'SNAT-' + self.__domain
-    self.__fwd_chain_name = 'FWD-' + self.__domain
+    # chain name can not be too long
+    chain_name_max_length = self.__config['chain_name_max_length']
+    if len(self.__domain) > (chain_name_max_length-5):
+      domain_chain = self.__domain[:(chain_name_max_length-14)] + '-' + hashlib.md5(self.__domain).hexdigest()[:8]
+    else:
+      domain_chain = self.__domain
+
+    self.__dnat_chain_name = 'DNAT-' + domain_chain
+    self.__snat_chain_name = 'SNAT-' + domain_chain
+    self.__fwd_chain_name = 'FWD-' + domain_chain
 
 
   def __start_snat(self):
@@ -211,6 +223,7 @@ def main():
   global_config = {}
   global_config['public_ip'] = config_all.get('public_ip', host_ip())
   global_config['local_range'] = config_all.get('local_range')
+  global_config['chain_name_max_length'] = config_all.get('chain_name_max_length', 28)
 
   domain_config = config_all['domain'].get(domain)
   if domain_config is None:

@@ -1,4 +1,6 @@
 {
+  "chain_name_max_length": 28,
+
   "public_ip": "222.222.222.222",
 
   "local_range": "192.168.122.0/24",
